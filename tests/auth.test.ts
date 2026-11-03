@@ -1,0 +1,87 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mkdtemp, mkdir, rm, readFile } from "node:fs/promises";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+let auth:typeof import("../src/lib/auth"),repo:typeof import("../src/lib/repository"),directory:string;
+const root=path.resolve(".test-data");
+beforeAll(async()=>{await mkdir(root,{recursive:true});directory=await mkdtemp(path.join(root,"auth-"));process.env.DWELL_DATA_DIR=directory;process.env.DWELL_EMPTY="true";repo=await import("../src/lib/repository");auth=await import("../src/lib/auth");});
+afterAll(async()=>{delete process.env.DWELL_DATA_DIR;delete process.env.DWELL_EMPTY;if(!directory.startsWith(root+path.sep))throw Error("Unexpected test directory");await rm(directory,{recursive:true,force:true});});
+const signup=(role:"owner"|"student",email:string)=>auth.authenticate({action:"signup",role,email,name:role==="owner"?"Test Owner":"Test Student",phone:"+91 98765 43210",password:"local-test-password-123"});
+const request=(token:string)=>new Request("http://localhost:3000/api/demo",{headers:{cookie:`dwell-session=${token}`}});
+describe("real local prototype accounts",()=>{
+  it("starts empty; signup, owner listing, discovery, invitation and acceptance work across accounts",async()=>{
+    expect((await repo.readDemo()).properties).toHaveLength(0);expect((await repo.readDemo()).people).toHaveLength(0);
+    const owner=await signup("owner","owner@example.test"),student=await signup("student","student@example.test");
+    expect((await auth.requireUser(request(owner.token))).role).toBe("owner");
+    await repo.mutateDemo({type:"addProperty",name:"My Real Property",locality:"Test locality",city:"Pune",address:"10 Test Street, Pune",price:9000,category:"PG",rooms:1,bedsPerRoom:2},randomUUID(),owner.user);
+    const discovery=await repo.readDemo(student.user);expect(discovery.properties).toHaveLength(1);expect(discovery.properties[0].contact).toBe(owner.user.phone);expect(discovery.people).toHaveLength(1);
+    const location={latitude:18.5204,longitude:73.8567};
+    await repo.mutateDemo({type:"setPropertyLocation",propertyId:discovery.properties[0].id,location},randomUUID(),owner.user);
+    expect((await repo.readDemo(student.user)).properties[0].location).toEqual(location);
+    const summaries=await repo.readPublicListings();expect(summaries[0].available).toBe(2);
+    expect(Object.keys(summaries[0]).sort()).toEqual(["id","name","locality","city","category","price","image","amenities","available"].sort());
+    expect(JSON.stringify(summaries)).not.toContain(owner.user.email);expect(JSON.stringify(summaries)).not.toContain(owner.user.phone);
+    expect(discovery.properties[0].floors).toBeUndefined();
+    const bed=discovery.beds[0];await repo.mutateDemo({type:"invite",studentId:student.user.email!,bedId:bed.id,expectedVersion:bed.version,durationHours:48},randomUUID(),owner.user);
+    const allocation=(await repo.readDemo(student.user)).allocations.find(a=>a.studentId===student.user.id)!;
+    await repo.mutateDemo({type:"accept",studentId:student.user.id,allocationId:allocation.id,expectedVersion:allocation.version},randomUUID(),student.user);
+    expect((await repo.readDemo(owner.user)).allocations[0].state).toBe("held");
+    const stranger=await signup("owner","stranger@example.test");expect((await repo.readDemo(stranger.user)).properties).toHaveLength(0);
+    await expect(repo.mutateDemo({type:"setPropertyLocation",propertyId:discovery.properties[0].id,location:{latitude:0,longitude:0}},randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"setPropertyLocation",propertyId:discovery.properties[0].id,location:{latitude:0,longitude:0}},randomUUID(),student.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"appendFloors",propertyId:discovery.properties[0].id,floors:[{number:2,images:[],rooms:[{number:"201",beds:2,images:[]}]}]},randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"setPropertyPhotos",propertyId:discovery.properties[0].id,images:[],floors:[{number:1,images:[],rooms:[{number:"101",beds:2,images:[]}]}]},randomUUID(),student.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"appendRooms",propertyId:discovery.properties[0].id,floor:1,rooms:[{number:"102",beds:1,bedLabels:["102-A"],images:[]}]},randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"appendBedSlots",propertyId:discovery.properties[0].id,floor:1,room:"101",labels:["101-C"]},randomUUID(),student.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"block",bedId:bed.id,expectedVersion:bed.version,reason:"Unauthorized owner action"},randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"save",studentId:student.user.id,propertyId:discovery.properties[0].id},randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo({type:"reset"},randomUUID(),owner.user)).rejects.toMatchObject({status:403});
+    expect((await repo.readDemo(student.user)).requests).toEqual({});
+  });
+  it("normalizes email, rejects duplicates and incorrect passwords, and revokes logout sessions",async()=>{
+    await expect(signup("student","STUDENT@example.test")).rejects.toMatchObject({code:"EMAIL_EXISTS"});
+    await expect(auth.authenticate({action:"login",email:"student@example.test",password:"wrong"})).rejects.toMatchObject({status:401});
+    const login=await auth.authenticate({action:"login",email:"STUDENT@example.test",password:"local-test-password-123"});
+    expect((await auth.requireUser(request(login.token))).email).toBe("student@example.test");await auth.logout(request(login.token));
+    await expect(auth.requireUser(request(login.token))).rejects.toMatchObject({status:401});
+    const disk=await readFile(path.join(directory,"accounts.json"),"utf8");expect(disk).not.toContain("local-test-password-123");expect(disk).not.toContain(login.token);
+  });
+  it("rejects absent sessions, short passwords and role impersonation",async()=>{
+    await expect(auth.requireUser(new Request("http://localhost"))).rejects.toMatchObject({status:401});
+    await expect(auth.authenticate({action:"signup",name:"Short",email:"short@example.test",phone:"1234567890",password:"123",role:"owner"})).rejects.toMatchObject({status:422});
+    const student=await auth.authenticate({action:"login",email:"student@example.test",password:"local-test-password-123"});
+    await expect(repo.mutateDemo({type:"addProperty",name:"Forbidden",locality:"Pune",city:"Pune",address:"10 Test Street",category:"PG",price:9000,rooms:1,bedsPerRoom:1},randomUUID(),student.user)).rejects.toMatchObject({status:403});
+  });
+  it("shows floor and room media only to the owner and students with active detail access",async()=>{
+    const owner=await auth.authenticate({action:"login",email:"owner@example.test",password:"local-test-password-123"});
+    const student=await auth.authenticate({action:"login",email:"student@example.test",password:"local-test-password-123"});
+    const p=(await repo.readDemo(owner.user)).properties[0];
+    const photo="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aH5cAAAAASUVORK5CYII=";
+    await repo.mutateDemo({type:"setPropertyPhotos",propertyId:p.id,images:[photo],floors:[{number:1,images:[photo],rooms:[{number:"101",beds:2,images:[photo]}]}]},randomUUID(),owner.user);
+    expect((await repo.readDemo(student.user)).properties[0].floors).toBeUndefined();
+    expect((await repo.readPublicListings())[0].image).toBe(photo);
+    await repo.mutateDemo({type:"demoCredits",studentId:student.user.id},randomUUID());
+    await repo.mutateDemo({type:"unlock",studentId:student.user.id,propertyId:p.id},randomUUID(),student.user);
+    expect((await repo.readDemo(student.user)).properties[0].floors?.[0].rooms[0].images).toEqual([photo]);
+  });
+  it("allows only the property owner to manage offline status and keeps guest contacts private",async()=>{
+    const owner=await auth.authenticate({action:"login",email:"owner@example.test",password:"local-test-password-123"});
+    const student=await auth.authenticate({action:"login",email:"student@example.test",password:"local-test-password-123"});
+    const stranger=await auth.authenticate({action:"login",email:"stranger@example.test",password:"local-test-password-123"});
+    const b=(await repo.readDemo(owner.user)).beds[1],count=(await repo.readDemo()).people.length;
+    const command={type:"ownerSetBedStatus" as const,bedId:b.id,expectedVersion:b.version,status:"on_hold" as const,durationHours:2,offlineGuest:{name:"Private offline visitor",phone:"+91 81111 12222"},studentId:student.user.id};
+    await expect(repo.mutateDemo(command,randomUUID(),student.user)).rejects.toMatchObject({status:403});
+    await expect(repo.mutateDemo(command,randomUUID(),stranger.user)).rejects.toMatchObject({status:403});
+    const result=await repo.mutateDemo(command,randomUUID(),owner.user);const record=result.state.allocations.find(a=>a.bedId===b.id&&a.state==="held")!;
+    expect(record.studentId).toBe("");expect(record.offlineGuest?.phone).toBe("+91 81111 12222");expect(result.state.people).not.toContainEqual(expect.objectContaining({name:"Private offline visitor"}));expect((await repo.readDemo()).people).toHaveLength(count);
+    const studentView=JSON.stringify(await repo.readDemo(student.user));expect(studentView).not.toContain("Private offline visitor");expect(studentView).not.toContain("81111");
+    expect(result.state.activity.some(a=>a.bedId===b.id)).toBe(true);expect((await repo.readDemo(stranger.user)).activity).toHaveLength(0);
+    await repo.mutateDemo({type:"ownerSetBedStatus",bedId:b.id,expectedVersion:result.state.beds.find(x=>x.id===b.id)!.version,status:"available",durationHours:48,reason:"Visitor cancelled after the offline visit."},randomUUID(),owner.user);
+  });
+  it("links an offline booking by registered email so the student can see their stay",async()=>{
+    const linked=await signup("student","linked@example.test"),owner=await auth.authenticate({action:"login",email:"owner@example.test",password:"local-test-password-123"});
+    const b=(await repo.readDemo(owner.user)).beds[1];
+    await repo.mutateDemo({type:"ownerSetBedStatus",bedId:b.id,expectedVersion:b.version,status:"booked",durationHours:48,studentEmail:"LINKED@example.test",moveInDate:"2026-11-04",agreedPrice:9000},randomUUID(),owner.user);
+    const own=(await repo.readDemo(linked.user)).allocations.find(a=>a.bedId===b.id&&a.studentId===linked.user.id);expect(own?.state).toBe("booked");expect(own?.source).toBe("offline");expect((await repo.readDemo(linked.user)).notices.some(n=>n.title.includes("booking"))).toBe(true);
+  });
+});
